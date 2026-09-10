@@ -1,0 +1,28 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: '0 18 * * 0' # 每週日 UTC 18:00（台灣時間週一 02:00）
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    if: github.repository == 'tinacc0701-wq/IELTS-practice'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Merge upstream main
+        run: |
+          git remote add upstream https://github.com/sallowayma-git/IELTS-practice.git
+          git fetch upstream main
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git merge upstream/main --no-edit -m "chore: sync upstream/main"
+          git push origin main
