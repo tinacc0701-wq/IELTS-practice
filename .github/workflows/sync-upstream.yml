@@ -24,13 +24,19 @@ jobs:
           git fetch upstream main
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          before="$(git rev-parse HEAD)"
           git merge upstream/main --no-edit -m "chore: sync upstream/main"
+          after="$(git rev-parse HEAD)"
 
           # GITHUB_TOKEN can never be granted permission to push changes under
           # .github/workflows (GitHub blocks this unconditionally). Restore that
           # directory to its pre-merge state so the push has no diff there;
-          # everything else from upstream still syncs normally.
-          if git rev-parse -q --verify HEAD^2 >/dev/null; then
+          # everything else from upstream still syncs normally. Only do this
+          # when this run actually produced a new merge commit - otherwise
+          # (e.g. upstream had nothing new) HEAD is just last run's already-
+          # pushed commit, and amending it would rewrite pushed history and
+          # make the push rejected as non-fast-forward.
+          if [ "$before" != "$after" ] && git rev-parse -q --verify HEAD^2 >/dev/null; then
             rm -rf .github/workflows
             git checkout HEAD^1 -- .github/workflows
             git add -A .github/workflows
