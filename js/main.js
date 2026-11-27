@@ -474,6 +474,18 @@ async function syncPracticeRecords(options = {}) {
         }
     } catch (_) { /* 保底不中断同步流程 */ }
 
+    console.log(`[System] 已从 AppData 加载 ${records.length} 条练习摘要。`);
+    // 评分只改复盘计划，不改练习摘要。即使摘要签名没有变化，也必须重新读取队列；
+    // 否则其他标签页的评分会让徽标、排序与复盘统计一直停留在旧快照。
+    // Publish the article review index before scheduling the completion repaint,
+    // so existing Browse cards can expose Replay even when this read is delayed.
+    let reviewQueueChanged = false;
+    try {
+        reviewQueueChanged = await loadPracticeReviewQueue();
+    } catch (error) {
+        console.warn('[Review] 同步复盘队列失败:', error);
+    }
+
     // Publish Browse ownership only after the derived completion state,
     // anchors, and any active-view repaint have accepted this snapshot. A
     // newer invocation that reads successfully but fails publication must not
@@ -495,8 +507,7 @@ async function syncPracticeRecords(options = {}) {
         }
     }
 
-    console.log(`[System] 已从 AppData 加载 ${records.length} 条练习摘要。`);
-    if (!recordsUnchanged) {
+    if (!recordsUnchanged || reviewQueueChanged) {
         updatePracticeView(records, examIndex);
     } else if (typeof flushPracticeInsightsRender === 'function') {
         // A hidden-view sync may leave insights waiting. Activation must resume
@@ -1802,6 +1813,20 @@ function setupPracticeHistoryInteractions() {
         }
     };
 
+    const handleReview = (recordId, event) => {
+        if (!recordId) return;
+        if (event) {
+            event.preventDefault();
+            if (typeof event.stopPropagation === 'function') event.stopPropagation();
+        }
+        const flow = window.PracticeReviewFlow;
+        if (!flow || typeof flow.start !== 'function') {
+            if (typeof showMessage === 'function') showMessage('复盘功能尚未初始化', 'warning');
+            return;
+        }
+        flow.start(recordId);
+    };
+
     const handleSelection = (recordId, event) => {
         if (!getBulkDeleteModeState() || !recordId) return;
         if (event) event.preventDefault();
@@ -1830,6 +1855,10 @@ function setupPracticeHistoryInteractions() {
             handleDelete(this.dataset.recordId, event);
         });
 
+        window.DOM.delegate('click', '.practice-history-list [data-record-action="review"], #history-list [data-record-action="review"]', function (event) {
+            handleReview(this.dataset.reviewTaskId || this.dataset.recordId, event);
+        });
+
         window.DOM.delegate('click', '.practice-history-list .history-item, #history-list .history-item', function (event) {
             const actionTarget = event.target.closest('[data-record-action]');
             if (actionTarget) return;
@@ -1853,6 +1882,12 @@ function setupPracticeHistoryInteractions() {
             const deleteTarget = event.target.closest('[data-record-action="delete"]');
             if (deleteTarget && container.contains(deleteTarget)) {
                 handleDelete(deleteTarget.dataset.recordId, event);
+                return;
+            }
+
+            const reviewTarget = event.target.closest('[data-record-action="review"]');
+            if (reviewTarget && container.contains(reviewTarget)) {
+                handleReview(reviewTarget.dataset.reviewTaskId || reviewTarget.dataset.recordId, event);
                 return;
             }
 
@@ -1942,6 +1977,168 @@ function filterRealPracticeRecordsForView(records) {
     return classifier.filterRecordsForHistoryView(list);
 }
 
+// ---------------------------------------------------------------------------
+// 复盘队列（阅读）
+//
+// 队列本身不是第二份真相：它是 AppData.practice.listReviewQueue 在读取时形成的投影，
+// 这里只缓存最近一次快照，用于给历史列表加徽标、给复盘模式排序、给"复盘节奏"卡片供数。
+// 任何评分/落库之后都必须重新取一次，绝不本地推演状态。
+// ---------------------------------------------------------------------------
+const practiceReviewQueueState = {
+    generatedAt: null,
+    records: [],
+    byRecordId: new Map(),
+    byExamKey: new Map(),
+    order: new Map(),
+    stats: null,
+    signature: null,
+    loading: false,
+    pending: null
+};
+let practiceReviewModeEnabled = false;
+let practiceReviewViewSnapshot = null;
+
+function getPracticeReviewQueueSnapshot() {
+    return {
+        generatedAt: practiceReviewQueueState.generatedAt,
+        records: practiceReviewQueueState.records,
+        byRecordId: practiceReviewQueueState.byRecordId,
+        order: practiceReviewQueueState.order,
+        stats: practiceReviewQueueState.stats
+    };
+}
+
+function practiceReviewExamKey(libraryConfigurationId, examId) {
+    let currentExamId = String(examId || '').trim();
+    if (!currentExamId) return '';
+    if (typeof window.resolveReadingExamId === 'function') {
+        try {
+            currentExamId = String(window.resolveReadingExamId(currentExamId) || currentExamId).trim();
+        } catch (_) { /* keep the stored id */ }
+    }
+    const libraryId = libraryConfigurationId == null ? '' : String(libraryConfigurationId).trim();
+    return JSON.stringify([libraryId, currentExamId]);
+}
+
+function getPracticeReviewTaskForExam(exam) {
+    if (!exam) return null;
+    const metadata = exam && typeof exam === 'object' && exam.metadata && typeof exam.metadata === 'object'
+        ? exam.metadata : {};
+    const examId = typeof exam === 'object' ? (exam.id || exam.examId || metadata.examId) : exam;
+    const libraryConfigurationId = typeof exam === 'object'
+        ? (Object.prototype.hasOwnProperty.call(exam, 'libraryConfigurationId')
+            ? exam.libraryConfigurationId
+            : metadata.libraryConfigurationId)
+        : null;
+    const key = practiceReviewExamKey(libraryConfigurationId, examId);
+    return key ? practiceReviewQueueState.byExamKey.get(key) || null : null;
+}
+
+function isPracticeReviewModeEnabled() {
+    return practiceReviewModeEnabled === true;
+}
+
+function computePracticeReviewQueueSignature(records, stats) {
+    try {
+        // generatedAt changes on every read and is deliberately excluded. The records
+        // (including isDue/reviewState) and derived stats contain every render input.
+        return JSON.stringify({ records, stats: stats || null });
+    } catch (_) {
+        // Queue projections are JSON data, but a malformed host stub must not make a
+        // potentially changed snapshot look unchanged.
+        return null;
+    }
+}
+
+async function loadPracticeReviewQueue() {
+    const practice = window.AppData && window.AppData.practice;
+    if (!practice || typeof practice.listReviewQueue !== 'function') {
+        return false;
+    }
+    const queue = await practice.listReviewQueue();
+    const records = Array.isArray(queue && queue.records) ? queue.records : [];
+    const stats = queue && queue.stats ? queue.stats : null;
+    const nextSignature = computePracticeReviewQueueSignature(records, stats);
+    const changed = nextSignature === null || nextSignature !== practiceReviewQueueState.signature;
+    practiceReviewQueueState.generatedAt = queue && queue.generatedAt ? queue.generatedAt : null;
+    practiceReviewQueueState.stats = stats;
+    practiceReviewQueueState.records = records;
+    practiceReviewQueueState.signature = nextSignature;
+    practiceReviewQueueState.byRecordId = new Map();
+    practiceReviewQueueState.byExamKey = new Map();
+    records.forEach(record => {
+        practiceReviewQueueState.byRecordId.set(String(record.id), record);
+        const parentId = String(record.recordId || record.id);
+        if (!practiceReviewQueueState.byRecordId.has(parentId)) practiceReviewQueueState.byRecordId.set(parentId, record);
+        const metadata = record && record.metadata && typeof record.metadata === 'object' ? record.metadata : {};
+        const examKey = practiceReviewExamKey(
+            Object.prototype.hasOwnProperty.call(record, 'reviewLibraryConfigurationId')
+                ? record.reviewLibraryConfigurationId
+                : metadata.libraryConfigurationId,
+            record.reviewExamId || record.examId || metadata.examId
+        );
+        if (examKey && !practiceReviewQueueState.byExamKey.has(examKey)) {
+            practiceReviewQueueState.byExamKey.set(examKey, record);
+        }
+    });
+    practiceReviewQueueState.order = new Map(records.map((record, index) => [String(record.id), index]));
+    return changed;
+}
+
+function refreshPracticeReviewQueue(trigger = 'default', options = {}) {
+    if (practiceReviewQueueState.loading) {
+        // 合并并发请求：最后一个 forceRender 意图胜出，避免连点评分时排队重复渲染。
+        practiceReviewQueueState.pending = {
+            trigger,
+            options: Object.assign({}, practiceReviewQueueState.pending && practiceReviewQueueState.pending.options, options)
+        };
+        return practiceReviewQueueState.loading;
+    }
+    practiceReviewQueueState.loading = loadPracticeReviewQueue()
+        .then(() => {
+            if (options && options.forceRender) {
+                if (practiceReviewViewSnapshot) {
+                    updatePracticeView(practiceReviewViewSnapshot.records, practiceReviewViewSnapshot.examIndex);
+                } else {
+                    startPracticeRecordsSyncInBackground('review-queue:' + trigger, { forceRender: true });
+                }
+            }
+        })
+        .catch((error) => {
+            console.warn(`[Review] 读取复盘队列失败(${trigger}):`, error);
+        })
+        .finally(() => {
+            practiceReviewQueueState.loading = false;
+            const next = practiceReviewQueueState.pending;
+            practiceReviewQueueState.pending = null;
+            if (next) refreshPracticeReviewQueue(next.trigger, next.options);
+        });
+    return practiceReviewQueueState.loading;
+}
+
+function togglePracticeReviewMode(force = null) {
+    const next = force === null || force === undefined ? !practiceReviewModeEnabled : Boolean(force);
+    practiceReviewModeEnabled = next;
+    const button = document.getElementById('practice-review-mode-toggle');
+    if (button) {
+        button.classList.toggle('active', next);
+        button.setAttribute('aria-pressed', next ? 'true' : 'false');
+    }
+    refreshPracticeReviewQueue('review-mode-toggle', { forceRender: true });
+    if (typeof showMessage === 'function') {
+        showMessage(next ? '已进入复盘模式，仅显示需要复盘的阅读记录' : '已退出复盘模式', 'info');
+    }
+    return next;
+}
+
+if (typeof window !== 'undefined') {
+    window.refreshPracticeReviewQueue = refreshPracticeReviewQueue;
+    window.togglePracticeReviewMode = togglePracticeReviewMode;
+    window.isPracticeReviewModeEnabled = isPracticeReviewModeEnabled;
+    window.getPracticeReviewQueueSnapshot = getPracticeReviewQueueSnapshot;
+    window.getPracticeReviewTaskForExam = getPracticeReviewTaskForExam;
+}
+
 // Dashboard charts are independent of the history list. Yield a paint before
 // computing them, then give each section its own task. Keep the latest work for
 // a later Practice activation, rather than painting a hidden or stale view.
@@ -2019,6 +2216,9 @@ function flushPracticeInsightsRender() {
 
 // Phase 3: 练习记录视图更新 - 保留在 main.js（依赖多个组件，暂不迁移）
 function updatePracticeView(recordsSnapshot = [], examIndexSnapshot = []) {
+    // Ratings change scheduling, not practice facts. Reuse the published light
+    // history snapshot so a mode toggle need not reload insights/details.
+    practiceReviewViewSnapshot = { records: recordsSnapshot, examIndex: examIndexSnapshot };
     if (typeof window.requestAnimationFrame === 'function' && !isPracticeInsightsViewActive()) {
         // Data publication still happens in syncPracticeRecords. Only the
         // hidden Practice DOM/calculations wait until this view is activated.
@@ -2089,6 +2289,7 @@ function updatePracticeView(recordsSnapshot = [], examIndexSnapshot = []) {
         });
     }
 
+    const reviewQueue = getPracticeReviewQueueSnapshot();
     // --- 4. Render history list ---
     const renderer = window.PracticeHistoryRenderer;
     if (!renderer) {
@@ -2096,12 +2297,26 @@ function updatePracticeView(recordsSnapshot = [], examIndexSnapshot = []) {
         return;
     }
 
+    // 复盘模式只收窄"显示哪些记录"，不改变上面的统计/趋势/洞察输入，
+    // 也不改变普通模式下练习历史的任何行为。
+    const reviewMode = isPracticeReviewModeEnabled();
+    let recordsForList = recordsToShow;
+    if (reviewMode) {
+        const originals = new Map(records.map(record => [String(record.id), record]));
+        recordsForList = reviewQueue.records.map(task => Object.assign({}, originals.get(String(task.recordId || task.id)), task))
+            .filter(record => examType === 'all' || recordMatchesExamType(record, examType, examIndex))
+            .filter(record => !historyQuery || [record.title, record.examId, record.date]
+                .some(value => String(value || '').toLowerCase().includes(historyQuery)));
+    }
+
     const renderResult = typeof renderer.renderView === 'function'
         ? renderer.renderView({
             container: historyContainer,
-            records: recordsToShow,
+            records: recordsForList,
             bulkDeleteMode: getBulkDeleteModeState(),
             selectedRecords: getSelectedRecordsState(),
+            reviewMode,
+            reviewQueue,
             scrollerOptions: { itemHeight: 100, containerHeight: 650 },
             scroller: practiceListScroller
         })
@@ -2125,7 +2340,7 @@ function updatePracticeView(recordsSnapshot = [], examIndexSnapshot = []) {
         () => {
             const priorityRenderer = ensurePracticePriorityRenderer();
             if (priorityRenderer && typeof priorityRenderer.update === 'function') {
-                priorityRenderer.update(recordsForInsights, examIndex, { examType, partsRecords: records });
+                priorityRenderer.update(recordsForInsights, examIndex, { examType, partsRecords: records, reviewStats: reviewQueue.stats });
             }
         }
     ]);
@@ -2340,7 +2555,9 @@ function refreshBrowseProgressFromRecords(
         // anchor snapshot; durable anchor persistence remains downstream of
         // that accepted projection. The completion commit is then one
         // non-throwing assignment.
-        const preparedCompletionIndex = prepareBrowseCompletionIndex(recordSnapshot);
+        const preparedCompletionIndex = prepareBrowseCompletionIndex(recordSnapshot, {
+            exams: indexSnapshot
+        });
         if (!isPreparedBrowseCompletionIndex(preparedCompletionIndex)) {
             return false;
         }
@@ -3116,6 +3333,12 @@ async function initializeBrowseView(options = {}) {
             return null;
         }
 
+        // Completion dots come from the practice projection. A cold start that
+        // opens Browse without visiting Practice must still load it once.
+        if (browsePracticeProjectionGeneration === 0) {
+            startPracticeRecordsSyncInBackground('browse-view');
+        }
+
         // 初始化 browseController
         if (window.browseController && !window.browseController.buttonContainer) {
             window.browseController.initialize('type-filter-buttons', examIndex);
@@ -3187,6 +3410,15 @@ async function activateBrowseView(options = {}) {
         });
         if (!Array.isArray(examIndex)
             || !isBrowseResultsRequestCurrent(activeRequestId)
+            || !isBrowseForegroundRenderEpochCurrent(foregroundEpoch)) {
+            return false;
+        }
+        try {
+            await loadPracticeReviewQueue();
+        } catch (error) {
+            console.warn('[Browse] 读取文章复盘入口失败:', error);
+        }
+        if (!isBrowseResultsRequestCurrent(activeRequestId)
             || !isBrowseForegroundRenderEpochCurrent(foregroundEpoch)) {
             return false;
         }
@@ -3656,25 +3888,41 @@ function createFallbackExamCard(exam, options = {}) {
         });
         actions.appendChild(selectBtn);
     } else {
-        const startBtn = document.createElement('button');
-        startBtn.className = 'btn exam-item-action-btn';
-        startBtn.type = 'button';
-        startBtn.textContent = '开始练习';
-        startBtn.addEventListener('click', function () {
-            openExam(exam.id);
-        });
-        actions.appendChild(startBtn);
+        const isListeningExam = !!(window.ResourceCore
+            && typeof window.ResourceCore.isListeningExam === 'function'
+            && window.ResourceCore.isListeningExam(exam));
+        const pdfAvailable = isListeningExam || !!(window.ResourceCore
+            && typeof window.ResourceCore.isPdfAvailable === 'function'
+            && window.ResourceCore.isPdfAvailable(exam));
 
-        const pdfBtn = document.createElement('button');
-        pdfBtn.className = 'btn btn-outline exam-item-action-btn';
-        pdfBtn.type = 'button';
-        pdfBtn.textContent = 'PDF';
-        pdfBtn.addEventListener('click', function () {
-            viewPDF(exam.id);
-        });
-        actions.appendChild(pdfBtn);
+        if (exam.hasHtml !== false || pdfAvailable) {
+            const startBtn = document.createElement('button');
+            startBtn.className = 'btn exam-item-action-btn';
+            startBtn.type = 'button';
+            startBtn.textContent = '开始练习';
+            startBtn.addEventListener('click', function () {
+                openExam(exam.id);
+            });
+            actions.appendChild(startBtn);
+        }
 
-        const isReading = exam && (exam.type === 'reading' || !exam.type || String(exam.type).toLowerCase() !== 'listening') && exam.hasHtml !== false;
+        if (pdfAvailable) {
+            const pdfBtn = document.createElement('button');
+            pdfBtn.className = 'btn btn-outline exam-item-action-btn';
+            pdfBtn.type = 'button';
+            pdfBtn.textContent = 'PDF';
+            pdfBtn.addEventListener('click', function () {
+                viewPDF(exam.id);
+            });
+            actions.appendChild(pdfBtn);
+        } else {
+            const pdfUnavailable = document.createElement('span');
+            pdfUnavailable.className = 'pdf-unavailable-state exam-item-pdf-unavailable';
+            pdfUnavailable.textContent = '此PDF不存在';
+            actions.appendChild(pdfUnavailable);
+        }
+
+        const isReading = exam && !isListeningExam && exam.hasHtml !== false;
         if (isReading && exam && exam.id) {
             const vocabBtn = document.createElement('button');
             vocabBtn.className = 'btn btn-outline exam-item-action-btn exam-item-vocab-btn';
@@ -3918,13 +4166,145 @@ function openExam(examId, options = {}) {
     return showMessage('统一练习入口未就绪：app.openExam 不可用，已阻止打开原始题源 HTML。', 'error');
 }
 
-async function viewPDF(examId) {
-    const list = await resolveActiveExamIndex();
-    const exam = list.find(e => e.id === examId);
-    if (!exam || !exam.pdfFilename) return showMessage('未找到PDF文件', 'error');
+async function viewPDF(examId, launchOptions = {}) {
+    const safeLaunchOptions = launchOptions && typeof launchOptions === 'object'
+        ? launchOptions
+        : {};
+    let reservedWindow = safeLaunchOptions.reservedWindow || null;
+    let ownsReservedWindow = Boolean(reservedWindow && safeLaunchOptions.ownsReservedWindow === true);
+    let reservationAttempted = safeLaunchOptions.reservationAttempted === true;
+    if (!reservedWindow && !reservationAttempted) {
+        reservationAttempted = true;
+        try {
+            reservedWindow = window.open(
+                'about:blank',
+                '_blank',
+                'width=1000,height=800,scrollbars=yes,resizable=yes,status=yes,toolbar=yes'
+            );
+            ownsReservedWindow = Boolean(reservedWindow);
+        } catch (_) { }
+    }
 
-    const fullPath = window.buildResourcePath(exam, 'pdf');
-    openPDFSafely(fullPath, exam.title);
+    const closeReservedWindow = () => {
+        if (!ownsReservedWindow || !reservedWindow || reservedWindow.closed
+            || typeof reservedWindow.close !== 'function') {
+            return;
+        }
+        try { reservedWindow.close(); } catch (_) { }
+    };
+
+    let list;
+    try {
+        list = await resolveActiveExamIndex();
+    } catch (error) {
+        closeReservedWindow();
+        throw error;
+    }
+    const exam = Array.isArray(list) ? list.find(e => e.id === examId) : null;
+    const resourceCore = getResourceCore();
+    const isListeningExam = Boolean(
+        resourceCore
+        && typeof resourceCore.isListeningExam === 'function'
+        && resourceCore.isListeningExam(exam)
+    );
+
+    if (isListeningExam) {
+        if (typeof exam.pdfFilename !== 'string' || !exam.pdfFilename.trim()) {
+            closeReservedWindow();
+            return showMessage('未找到PDF文件', 'error');
+        }
+        let listeningPdfPath = '';
+        try {
+            listeningPdfPath = window.buildResourcePath(exam, 'pdf');
+        } catch (error) {
+            closeReservedWindow();
+            console.warn('[PDF] 听力资源路径构建失败:', error);
+            return showMessage('未找到PDF文件', 'error');
+        }
+        let resourceResolution = null;
+        if (/^blob:/i.test(String(listeningPdfPath || '').trim())
+            && resourceCore
+            && typeof resourceCore.resolveResource === 'function') {
+            try {
+                resourceResolution = await resourceCore.resolveResource(exam, 'pdf');
+            } catch (error) {
+                console.warn('[PDF] 听力 Blob 资源解析失败:', error);
+            }
+        }
+        return openPDFSafely(listeningPdfPath, exam.title, {
+            reservationAttempted,
+            reservedWindow,
+            ownsReservedWindow,
+            preventCurrentWindowFallback: true,
+            resourceResolution
+        });
+    }
+
+    const isAvailable = Boolean(
+        exam
+        && resourceCore
+        && typeof resourceCore.isPdfAvailable === 'function'
+        && resourceCore.isPdfAvailable(exam)
+    );
+    if (!isAvailable) {
+        closeReservedWindow();
+        return showMessage('此PDF不存在', 'error');
+    }
+
+    const protocol = window.location && window.location.protocol
+        ? String(window.location.protocol).toLowerCase()
+        : '';
+    let fullPath = '';
+    let resourceResolution = null;
+
+    if (protocol === 'http:' || protocol === 'https:') {
+        if (typeof resourceCore.resolveResource !== 'function') {
+            closeReservedWindow();
+            return showMessage('此PDF不存在', 'error');
+        }
+        try {
+            resourceResolution = await resourceCore.resolveResource(exam, 'pdf');
+            fullPath = resourceResolution && typeof resourceResolution.url === 'string'
+                ? resourceResolution.url.trim()
+                : '';
+        } catch (error) {
+            console.warn('[PDF] 资源解析失败:', error);
+        }
+    } else if (typeof window.buildResourcePath === 'function') {
+        try {
+            fullPath = window.buildResourcePath(exam, 'pdf');
+        } catch (error) {
+            closeReservedWindow();
+            console.warn('[PDF] 资源路径构建失败:', error);
+            return showMessage('此PDF不存在', 'error');
+        }
+        if (/^blob:/i.test(String(fullPath || '').trim())
+            && resourceCore
+            && typeof resourceCore.resolveResource === 'function') {
+            try {
+                resourceResolution = await resourceCore.resolveResource(exam, 'pdf');
+                fullPath = resourceResolution && typeof resourceResolution.url === 'string'
+                    ? resourceResolution.url.trim()
+                    : '';
+            } catch (error) {
+                console.warn('[PDF] Blob 资源解析失败:', error);
+                fullPath = '';
+            }
+        }
+    }
+
+    if (!fullPath) {
+        closeReservedWindow();
+        return showMessage('此PDF不存在', 'error');
+    }
+
+    return openPDFSafely(fullPath, exam.title, {
+        reservationAttempted,
+        reservedWindow,
+        ownsReservedWindow,
+        preventCurrentWindowFallback: true,
+        resourceResolution
+    });
 }
 
 // Bridge for record details to existing enhancer/modal if present
@@ -3950,16 +4330,62 @@ function showRecordDetails(recordId) {
 }
 
 // Provide a local implementation to avoid dependency on legacy js/script.js
-function openPDFSafely(pdfPath, examTitle = 'PDF') {
-    try {
-        if (pdfHandler && typeof pdfHandler.openPDF === 'function') {
-            return pdfHandler.openPDF(pdfPath, examTitle, { width: 1000, height: 800 });
+function openPDFSafely(pdfPath, examTitle = 'PDF', options = {}) {
+    const reservedWindow = options && options.reservedWindow;
+    const ownsReservedWindow = Boolean(reservedWindow && options.ownsReservedWindow === true);
+    const reservationAttempted = options.reservationAttempted === true;
+    const closeReservedWindow = () => {
+        if (!ownsReservedWindow || !reservedWindow || reservedWindow.closed
+            || typeof reservedWindow.close !== 'function') {
+            return;
         }
-        let pdfWindow = null;
-        try {
-            pdfWindow = window.open(pdfPath, `pdf_${Date.now()}`, 'width=1000,height=800,scrollbars=yes,resizable=yes,status=yes,toolbar=yes');
-        } catch (_) { }
+        try { reservedWindow.close(); } catch (_) { }
+    };
+    try {
+        if (/^blob:/i.test(String(pdfPath || '').trim())) {
+            const resourceCore = getResourceCore();
+            const approved = Boolean(
+                resourceCore
+                && typeof resourceCore.isApprovedPdfResolution === 'function'
+                && resourceCore.isApprovedPdfResolution(options.resourceResolution, pdfPath)
+            );
+            if (!approved) {
+                closeReservedWindow();
+                showMessage('打开PDF失败', 'error');
+                return null;
+            }
+        }
+        if (pdfHandler && typeof pdfHandler.openPDF === 'function') {
+            return pdfHandler.openPDF(pdfPath, examTitle, {
+                width: 1000,
+                height: 800,
+                reservationAttempted,
+                reservedWindow,
+                ownsReservedWindow,
+                preventCurrentWindowFallback: options.preventCurrentWindowFallback === true,
+                resourceResolution: options.resourceResolution || null
+            });
+        }
+        let pdfWindow = reservedWindow && !reservedWindow.closed ? reservedWindow : null;
+        if (pdfWindow) {
+            try {
+                pdfWindow.location.href = pdfPath;
+                if (typeof pdfWindow.focus === 'function') pdfWindow.focus();
+            } catch (_) {
+                pdfWindow = null;
+            }
+        }
+        if (!pdfWindow && !reservationAttempted && !options.preventCurrentWindowFallback) {
+            try {
+                pdfWindow = window.open(pdfPath, `pdf_${Date.now()}`, 'width=1000,height=800,scrollbars=yes,resizable=yes,status=yes,toolbar=yes');
+            } catch (_) { }
+        }
         if (!pdfWindow) {
+            if (reservationAttempted || options.preventCurrentWindowFallback) {
+                closeReservedWindow();
+                showMessage('无法打开PDF窗口，请检查弹窗设置', 'error');
+                return null;
+            }
             try {
                 // 降级：当前窗口打开
                 window.location.href = pdfPath;
@@ -3972,6 +4398,7 @@ function openPDFSafely(pdfPath, examTitle = 'PDF') {
         showMessage('正在打开PDF...', 'info');
         return pdfWindow;
     } catch (error) {
+        closeReservedWindow();
         console.error('[PDF] 打开失败:', error);
         showMessage('打开PDF失败', 'error');
         return null;
@@ -4003,7 +4430,22 @@ function updateSystemInfo(examIndex = []) {
     const lastUpdateEl = document.getElementById('last-update');
 
     if (htmlExamsEl) htmlExamsEl.textContent = readingExams.length + listeningExams.length; // Simplified
-    if (pdfExamsEl) pdfExamsEl.textContent = examIndexSnapshot.filter(e => e.pdfFilename).length;
+    if (pdfExamsEl) {
+        const resourceCore = getResourceCore();
+        pdfExamsEl.textContent = examIndexSnapshot.filter((exam) => {
+            const isListeningExam = Boolean(
+                resourceCore
+                && typeof resourceCore.isListeningExam === 'function'
+                && resourceCore.isListeningExam(exam)
+            );
+            if (isListeningExam) {
+                return Boolean(typeof exam.pdfFilename === 'string' && exam.pdfFilename.trim());
+            }
+            return Boolean(resourceCore
+                && typeof resourceCore.isPdfAvailable === 'function'
+                && resourceCore.isPdfAvailable(exam));
+        }).length;
+    }
     if (lastUpdateEl) lastUpdateEl.textContent = new Date().toLocaleString();
 }
 
@@ -5013,27 +5455,48 @@ function resolveLibraryConfigContainer(options) {
 }
 
 async function renderLibraryConfigList(options = {}) {
+    const isCurrent = typeof options.isCurrent === 'function' ? options.isCurrent : () => true;
+    const shouldRender = () => {
+        try {
+            return isCurrent() !== false;
+        } catch (_) {
+            return false;
+        }
+    };
+    if (!shouldRender()) {
+        return null;
+    }
     const container = resolveLibraryConfigContainer(options);
     if (!container) {
         return null;
     }
 
     let configs = Array.isArray(options.configs) ? options.configs : await resolveLibraryConfigurations();
+    if (!shouldRender()) {
+        return null;
+    }
     if (!configs.length) {
         if (options.silentEmpty) {
             const existingHost = container.querySelector('.library-config-list');
-            if (existingHost) {
+            if (existingHost && shouldRender()) {
                 existingHost.remove();
             }
-        } else if (typeof showMessage === 'function') {
+        } else if (shouldRender() && typeof showMessage === 'function') {
             showMessage('暂无题库配置记录', 'info');
         }
         return null;
     }
 
-    const activeKey = options.activeKey || await getActiveLibraryConfigurationKey();
+    const hasSuppliedActiveKey = Object.prototype.hasOwnProperty.call(options, 'activeKey');
+    const activeKey = hasSuppliedActiveKey ? options.activeKey : await getActiveLibraryConfigurationKey();
+    if (!shouldRender()) {
+        return null;
+    }
     const view = ensureLibraryConfigView();
     if (view) {
+        if (!shouldRender()) {
+            return null;
+        }
         return view.mount(container, configs, {
             activeKey,
             allowDelete: options.allowDelete !== false,
@@ -5045,6 +5508,9 @@ async function renderLibraryConfigList(options = {}) {
         });
     }
 
+    if (!shouldRender()) {
+        return null;
+    }
     return renderLibraryConfigFallback(container, configs, { activeKey, emptyMessage: options.emptyMessage });
 }
 
@@ -5059,25 +5525,10 @@ async function showLibraryConfigListV2(options) {
 // 切换题库配置
 async function switchLibraryConfig(configKey) {
     const key = typeof configKey === 'string' && configKey.trim() ? configKey.trim() : null;
-    try {
-        const activeKey = await getActiveLibraryConfigurationKey();
-        if (activeKey === key) {
-            showMessage('当前题库已激活', 'info');
-            return;
-        }
-    } catch (error) {
-        console.warn('[LibraryConfig] 无法读取当前题库配置', error);
+    if (window.LibraryManager && typeof window.LibraryManager.switchLibraryConfig === 'function') {
+        return window.LibraryManager.switchLibraryConfig(key);
     }
-    const dataset = await fetchLibraryDataset(key);
-    if (!Array.isArray(dataset) || dataset.length === 0) {
-        showMessage('目标题库没有题目，请先加载该题库数据', 'warning');
-        return;
-    }
-    showMessage('正在切换题库配置...', 'info');
-    const applied = await applyLibraryConfiguration(key, dataset, { skipConfigRefresh: false });
-    if (applied) {
-        showMessage('题库配置已切换', 'success');
-    }
+    return false;
 }
 
 // 删除题库配置
@@ -5187,12 +5638,49 @@ function startSuitePractice() {
 }
 
 // Phase 3: 打开题目 - 已迁移到 app-actions.js
-function openExamWithFallback(exam, delay = 600) {
-    if (window.AppActions && typeof window.AppActions.openExamWithFallback === 'function') {
-        return window.AppActions.openExamWithFallback(exam, delay);
+function closeOwnedReservedPdfWindow(options) {
+    if (!options || options.ownsReservedWindow !== true) return;
+    const reservedWindow = options.reservedWindow;
+    if (!reservedWindow || reservedWindow.closed || typeof reservedWindow.close !== 'function') return;
+    try { reservedWindow.close(); } catch (_) { }
+}
+
+function transferReservedWindowForHtml(options) {
+    const launchOptions = options && typeof options === 'object' ? options : {};
+    const reservedWindow = launchOptions.reservedWindow;
+    if (reservedWindow && !reservedWindow.closed) {
+        launchOptions.reuseWindow = reservedWindow;
     }
+    return launchOptions;
+}
+
+function reserveRandomPracticePdfWindow() {
+    const launchOptions = {
+        reservedWindow: null,
+        reservationAttempted: true,
+        ownsReservedWindow: false,
+        preventCurrentWindowFallback: true
+    };
+    if (typeof window.open !== 'function') return launchOptions;
+    try {
+        launchOptions.reservedWindow = window.open(
+            'about:blank',
+            '_blank',
+            'width=1000,height=800,scrollbars=yes,resizable=yes,status=yes,toolbar=yes'
+        );
+        launchOptions.ownsReservedWindow = Boolean(launchOptions.reservedWindow);
+    } catch (_) { }
+    return launchOptions;
+}
+
+function openExamWithFallback(exam, delay = 600, options = {}) {
+    if (window.AppActions && typeof window.AppActions.openExamWithFallback === 'function') {
+        return window.AppActions.openExamWithFallback(exam, delay, options);
+    }
+    const launchOptions = options && typeof options === 'object' ? options : {};
     // 降级：直接执行
     if (!exam) {
+        closeOwnedReservedPdfWindow(launchOptions);
         if (typeof showMessage === 'function') {
             showMessage('未找到可用题目', 'error');
         }
@@ -5201,11 +5689,12 @@ function openExamWithFallback(exam, delay = 600) {
     const launch = () => {
         try {
             if (exam.hasHtml) {
-                openExam(exam.id);
+                openExam(exam.id, transferReservedWindowForHtml(launchOptions));
             } else {
-                viewPDF(exam.id);
+                viewPDF(exam.id, launchOptions);
             }
         } catch (error) {
+            closeOwnedReservedPdfWindow(launchOptions);
             console.error('[main.js] 启动题目失败:', error);
             if (typeof showMessage === 'function') {
                 showMessage('无法打开题目，请检查题库路径', 'error');
@@ -5225,7 +5714,14 @@ async function startRandomPractice(category, type = 'reading', filterMode = null
         return window.AppActions.startRandomPractice(category, type, filterMode, path);
     }
     // 降级：直接执行
-    const list = await resolveActiveExamIndex();
+    const launchOptions = reserveRandomPracticePdfWindow();
+    let list;
+    try {
+        list = await resolveActiveExamIndex();
+    } catch (error) {
+        closeOwnedReservedPdfWindow(launchOptions);
+        throw error;
+    }
     const normalizedType = (!type || type === 'all') ? null : type;
     const normalizedPath = (typeof path === 'string' && path.trim()) ? path.trim() : null;
 
@@ -5248,6 +5744,7 @@ async function startRandomPractice(category, type = 'reading', filterMode = null
         }
     }
     if (pool.length === 0) {
+        closeOwnedReservedPdfWindow(launchOptions);
         if (typeof showMessage === 'function') {
             const typeLabel = normalizedType === 'listening' ? '听力' : (normalizedType === 'reading' ? '阅读' : '题库');
             showMessage(`${category} ${typeLabel} 分类暂无可用题目`, 'error');
@@ -5258,7 +5755,7 @@ async function startRandomPractice(category, type = 'reading', filterMode = null
     if (typeof showMessage === 'function') {
         showMessage(`随机选择: ${randomExam.title}`, 'info');
     }
-    openExamWithFallback(randomExam);
+    openExamWithFallback(randomExam, 600, launchOptions);
 }
 
 // Phase 4: 清理重复事件绑定
