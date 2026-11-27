@@ -1727,33 +1727,68 @@
             return item;
         }
 
-        const startBtn = document.createElement('button');
-        startBtn.className = 'btn exam-item-action-btn';
-        startBtn.type = 'button';
-        startBtn.dataset.action = 'start';
-        if (exam.id) {
-            startBtn.dataset.examId = exam.id;
-        }
-        startBtn.textContent = '开始练习';
-        if (isSelecting) {
-            startBtn.disabled = true;
-            startBtn.setAttribute('aria-disabled', 'true');
-        }
-        actions.appendChild(startBtn);
+        const isListeningExam = !!(global.ResourceCore
+            && typeof global.ResourceCore.isListeningExam === 'function'
+            && global.ResourceCore.isListeningExam(exam));
+        const pdfAvailable = isListeningExam || !!(global.ResourceCore
+            && typeof global.ResourceCore.isPdfAvailable === 'function'
+            && global.ResourceCore.isPdfAvailable(exam));
 
-        const pdfBtn = document.createElement('button');
-        pdfBtn.className = 'btn btn-outline exam-item-action-btn';
-        pdfBtn.type = 'button';
-        pdfBtn.dataset.action = 'pdf';
-        if (exam.id) {
-            pdfBtn.dataset.examId = exam.id;
+        // A reading PDF-only entry must not retain a hidden launch path when its
+        // PDF is unavailable. Listening entries keep their legacy actions.
+        if (exam.hasHtml !== false || pdfAvailable) {
+            const startBtn = document.createElement('button');
+            startBtn.className = 'btn exam-item-action-btn';
+            startBtn.type = 'button';
+            startBtn.dataset.action = 'start';
+            if (exam.id) {
+                startBtn.dataset.examId = exam.id;
+            }
+            startBtn.textContent = '开始练习';
+            if (isSelecting) {
+                startBtn.disabled = true;
+                startBtn.setAttribute('aria-disabled', 'true');
+            }
+            actions.appendChild(startBtn);
         }
-        pdfBtn.textContent = 'PDF';
-        if (isSelecting) {
-            pdfBtn.disabled = true;
-            pdfBtn.setAttribute('aria-disabled', 'true');
+
+        const reviewTask = !isSelecting && !isMemorizeSelecting
+            && exam.type === 'reading'
+            && typeof global.getPracticeReviewTaskForExam === 'function'
+            ? global.getPracticeReviewTaskForExam(exam)
+            : null;
+        if (reviewTask && reviewTask.id) {
+            const reviewBtn = document.createElement('button');
+            reviewBtn.className = 'btn btn-outline exam-item-action-btn';
+            reviewBtn.type = 'button';
+            reviewBtn.dataset.action = 'browse-review';
+            reviewBtn.dataset.examId = exam.id;
+            reviewBtn.dataset.reviewTaskId = reviewTask.id;
+            reviewBtn.textContent = '复盘';
+            reviewBtn.title = reviewTask.isDue ? '开始复盘这篇文章' : '提前复盘这篇文章';
+            actions.appendChild(reviewBtn);
         }
-        actions.appendChild(pdfBtn);
+
+        if (pdfAvailable) {
+            const pdfBtn = document.createElement('button');
+            pdfBtn.className = 'btn btn-outline exam-item-action-btn';
+            pdfBtn.type = 'button';
+            pdfBtn.dataset.action = 'pdf';
+            if (exam.id) {
+                pdfBtn.dataset.examId = exam.id;
+            }
+            pdfBtn.textContent = 'PDF';
+            if (isSelecting) {
+                pdfBtn.disabled = true;
+                pdfBtn.setAttribute('aria-disabled', 'true');
+            }
+            actions.appendChild(pdfBtn);
+        } else {
+            const pdfUnavailable = document.createElement('span');
+            pdfUnavailable.className = 'pdf-unavailable-state exam-item-pdf-unavailable';
+            pdfUnavailable.textContent = '此PDF不存在';
+            actions.appendChild(pdfUnavailable);
+        }
 
         if (isReadingMemorizeExam(exam)) {
             const vocabBtn = document.createElement('button');
@@ -1873,6 +1908,25 @@
                 return;
             }
 
+            if (action === 'browse-review') {
+                const flow = global.PracticeReviewFlow;
+                const reviewTaskId = target.dataset.reviewTaskId;
+                if (!flow || typeof flow.start !== 'function') {
+                    if (typeof global.showMessage === 'function') {
+                        global.showMessage('复盘功能尚未初始化', 'warning');
+                    }
+                    return;
+                }
+                if (!reviewTaskId) {
+                    if (typeof global.showMessage === 'function') {
+                        global.showMessage('未找到这篇文章的复盘记录', 'warning');
+                    }
+                    return;
+                }
+                flow.start(reviewTaskId);
+                return;
+            }
+
             if (action === 'start') {
                 if (global.app && typeof global.app.openExam === 'function') {
                     global.app.openExam(examId);
@@ -1939,6 +1993,9 @@
                 invoke(this, event);
             });
             global.DOM.delegate('click', '[data-action="reading-memorize-select"]', function (event) {
+                invoke(this, event);
+            });
+            global.DOM.delegate('click', '[data-action="browse-review"]', function (event) {
                 invoke(this, event);
             });
         } else if (typeof document !== 'undefined') {

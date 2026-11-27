@@ -6,6 +6,7 @@
     const SIMULATION_DRAFT_SYNC_MS = 1200;
     const READING_DRAFT_SYNC_MS = 1500;
     const SUBMIT_ACK_TIMEOUT_MS = 10000;
+    let submissionAckTimeoutMs = SUBMIT_ACK_TIMEOUT_MS;
     const NOTE_EDITOR_SAVE_DEBOUNCE_MS = 450;
     const NOTE_ROW_LONG_PRESS_MS = 100;
     const EXPLANATION_STYLE_ID = 'reading-explanation-style';
@@ -6486,7 +6487,7 @@
             return false;
         }
         clearSubmissionAckTimer();
-        state.submissionAckTimer = setTimeout(() => expirePendingSubmission(submission.id), SUBMIT_ACK_TIMEOUT_MS);
+        state.submissionAckTimer = setTimeout(() => expirePendingSubmission(submission.id), submissionAckTimeoutMs);
         return true;
     }
 
@@ -6650,6 +6651,7 @@
                 openNoteEditor,
                 closeNoteEditor,
                 applyReplayRecord,
+                acknowledgeReplayApplied,
                 setTimerRunning,
                 checkpointActiveSuiteDuration,
                 getSelectionHighlightTestState() {
@@ -6666,6 +6668,14 @@
                 acceptSubmissionAcknowledgement,
                 expirePendingSubmission,
                 retryPendingSubmission() { return retryPendingSubmission(pendingSubmission); },
+                setSubmissionAcknowledgementTimeoutMs(value) {
+                    const timeoutMs = Number(value);
+                    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < SUBMIT_ACK_TIMEOUT_MS || timeoutMs > 120000) {
+                        return false;
+                    }
+                    submissionAckTimeoutMs = timeoutMs;
+                    return true;
+                },
                 persistSimulationDraftMirror,
                 loadScript,
                 startInitLoop,
@@ -7141,6 +7151,27 @@
                 // ignore mark replay failures
             }
         }
+        // 只有到这里才算"内容 + 答案 + 解析"全部落地：renderExplanations 抛错会直接
+        // 跳过下面这条 ACK，宿主因此不会把这一篇算作已回放。
+        acknowledgeReplayApplied(data, entryExamId);
+    }
+
+    // 复盘调度的回放确认：只有宿主带了 reviewAttemptId（即这是一次真正的复盘）才回执，
+    // 普通"查看回放"不得触发任何复盘记账。
+    function acknowledgeReplayApplied(data = {}, entryExamId = '') {
+        const reviewAttemptId = data && data.reviewAttemptId != null ? String(data.reviewAttemptId).trim() : '';
+        const recordId = data && data.recordId != null ? String(data.recordId).trim() : '';
+        if (!reviewAttemptId || !recordId) {
+            return false;
+        }
+        return postMessage('REPLAY_APPLIED', {
+            examId: entryExamId || state.examId,
+            reviewSessionId: data.reviewSessionId != null ? String(data.reviewSessionId) : state.reviewSessionId,
+            reviewAttemptId,
+            recordId,
+            reviewEntryIndex: Number.isInteger(data.reviewEntryIndex) ? data.reviewEntryIndex : state.reviewEntryIndex,
+            appliedAt: new Date().toISOString()
+        });
     }
 
     function buildEnvelope(type, payload) {

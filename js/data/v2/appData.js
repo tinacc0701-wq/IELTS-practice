@@ -587,7 +587,7 @@
         const detail = { recordId: source.id };
         const annotations = { recordId: source.id };
         for (const [key, value] of Object.entries(source)) {
-            if (key === 'realData' || key === 'rawData' || key === 'answerMap' || key === 'answerList' || SUMMARY_FIELDS.has(key)) continue;
+            if (key === 'realData' || key === 'rawData' || key === 'answerMap' || key === 'answerList' || key === 'reviewState' || SUMMARY_FIELDS.has(key)) continue;
             if (ANNOTATION_FIELDS.has(key)) annotations[key] = withoutRawData(value);
             else if (key === 'suiteEntries') detail.suiteEntries = asArray(value).map((entry) => {
                 const next = Object.assign({}, asObject(entry));
@@ -605,6 +605,10 @@
                     if (next.realData && hasOwn(next.realData, annotationKey)) delete next.realData[annotationKey];
                     if (next.rawData && hasOwn(next.rawData, annotationKey)) delete next.rawData[annotationKey];
                 }
+                // Practice facts and annotations never carry scheduling state.
+                delete next.reviewState;
+                if (next.realData) delete next.realData.reviewState;
+                if (next.rawData) delete next.rawData.reviewState;
                 delete next.realData; delete next.rawData;
                 if (Object.keys(annotation).length) {
                     if (!annotations.suiteEntries) annotations.suiteEntries = {};
@@ -636,12 +640,39 @@
         delete joined.recordId;
         if (mode === 'detail' || mode === 'medium') return jsonValue(joined, 'practice detail projection');
         const annotationData = asObject(annotations);
-        for (const [key, value] of Object.entries(annotationData)) if (key !== 'recordId' && key !== 'suiteEntries') joined[key] = clone(value);
+        for (const [key, value] of Object.entries(annotationData)) if (key !== 'recordId' && key !== 'suiteEntries' && key !== 'reviewState') joined[key] = clone(value);
         if (Array.isArray(joined.suiteEntries)) {
             const suiteAnnotations = asObject(annotationData.suiteEntries);
             joined.suiteEntries = joined.suiteEntries.map((entry) => Object.assign({}, entry, clone(suiteAnnotations[String(entry.examId || asObject(entry.metadata).examId || entry.id)] || {})));
         }
         return jsonValue(joined, 'practice full projection');
+    }
+
+    // A retired catalog ID names the same passage as its canonical entry.
+    // Stored records keep what was saved; reads present the current ID.
+    function withCurrentExamIds(record) {
+        const resolve = global.resolveReadingExamId;
+        if (!record || typeof record !== 'object' || typeof resolve !== 'function') return record;
+        const renamed = (item) => {
+            if (!item || typeof item !== 'object') return item;
+            const metadata = asObject(item.metadata);
+            const examId = item.examId ? resolve(item.examId) : item.examId;
+            const metadataExamId = metadata.examId ? resolve(metadata.examId) : metadata.examId;
+            if (examId === item.examId && metadataExamId === metadata.examId) return item;
+            const next = Object.assign({}, item, { examId });
+            if (hasOwn(item, 'metadata')) next.metadata = Object.assign({}, metadata, { examId: metadataExamId });
+            return next;
+        };
+        let result = renamed(record);
+        for (const field of ['suiteEntries', 'suiteEntrySummaries']) {
+            if (!Array.isArray(record[field])) continue;
+            const entries = record[field].map(renamed);
+            if (entries.some((entry, index) => entry !== record[field][index])) {
+                if (result === record) result = Object.assign({}, record);
+                result[field] = entries;
+            }
+        }
+        return result;
     }
 
     function projectDetail(record) { return joinPracticeRecord(splitPracticeRecord(record).summary, splitPracticeRecord(record).detail, null, 'detail'); }
@@ -655,6 +686,12 @@
         throw new Error('AppData v2 requires PracticeRecordSource (js/data/practiceRecordSource.js)');
     }
     const isRealPracticeRecord = practiceRecordSource.isRealPracticeRecord;
+    const practiceReviewScheduler = global.PracticeReviewScheduler;
+    if (!practiceReviewScheduler
+        || typeof practiceReviewScheduler.createInitialState !== 'function'
+        || typeof practiceReviewScheduler.scheduleOutcome !== 'function') {
+        throw new Error('AppData v2 requires PracticeReviewScheduler (js/core/practiceReviewScheduler.js)');
+    }
 
     function computeStats(records) {
         const stats = defaultStats();
@@ -683,11 +720,199 @@
 
     function practiceType(record) {
         const metadata = asObject(record.metadata);
-        const hints = [record.type, record.practiceType, metadata.type, metadata.examType, metadata.practiceType,
-            record.examId, record.title, metadata.examId, metadata.title].filter(Boolean).join(' ').toLowerCase();
+        const explicitTypes = [record.type, record.examType, record.practiceType,
+            metadata.type, metadata.examType, metadata.practiceType];
+        for (const value of explicitTypes) {
+            const type = String(value || '').trim().toLowerCase().replace(/-suite$/, '');
+            if (type === 'reading' || type === 'listening') return type;
+        }
+        // Legacy records without a recognized type still use their descriptive hints.
+        const title = record.title || record.examTitle || metadata.examTitle || metadata.title;
+        const hints = [...explicitTypes, record.examId, title, metadata.examId, metadata.title]
+            .filter(Boolean).join(' ').toLowerCase();
         if (hints.includes('listen') || hints.includes('audio') || hints.includes('hearing')) return 'listening';
         if (hints.includes('read')) return 'reading';
         return null;
+    }
+
+    function reviewReferenceTime(summary) {
+        return validIso(summary.completedAt || summary.timestamp || summary.date) || nowIso();
+    }
+
+    // 复盘状态不是练习事实：它既不能被一次重新落库覆盖，也不能因为自身损坏而
+    // 阻断练习记录保存（那等于用调度元数据换掉用户真实成绩）。非法状态一律按“没有状态”
+    // 处理——listReviewQueue 同样会跳过它，用户重新完成一次练习即可重新入队。
+    function safeReviewState(value) {
+        if (!value) return null;
+        try { return practiceReviewScheduler.normalizeState(value); }
+        catch (_) { return null; }
+    }
+
+    function reviewWrongCount(summary) {
+        const total = Number(summary && summary.totalQuestions);
+        const correct = Number(summary && summary.correctAnswers);
+        if (!Number.isFinite(total) || !Number.isFinite(correct)) return 0;
+        return Math.max(0, total - correct);
+    }
+
+    const REVIEW_PLANS_KEY = 'practice.reviewPlans';
+
+    function normalizeReviewLibraryConfigurationId(value) {
+        const id = value === null || value === undefined ? '' : String(value).trim();
+        return id || null;
+    }
+
+    function articleReviewPlanId(libraryConfigurationId, examId) {
+        const libraryId = normalizeReviewLibraryConfigurationId(libraryConfigurationId) || '';
+        return 'article:' + encodeURIComponent(libraryId) + ':' + encodeURIComponent(String(examId || '').trim());
+    }
+
+    function reviewTaskId(plan) {
+        return 'article:' + encodeURIComponent(plan.id);
+    }
+
+    // Practice Review ships with article plans only. Ignore pre-release formats;
+    // queue reads never scan history or create/migrate a scheduling document.
+    function currentReviewPlans(value) {
+        return asArray(value).filter(plan => plan && plan.unit === 'article'
+            && hasOwn(plan, 'libraryConfigurationId')
+            && plan.libraryConfigurationId === normalizeReviewLibraryConfigurationId(plan.libraryConfigurationId)
+            && typeof plan.examId === 'string' && plan.examId.trim() === plan.examId && plan.examId
+            && plan.id === articleReviewPlanId(plan.libraryConfigurationId, plan.examId)
+            && typeof plan.recordId === 'string' && plan.recordId
+            && (plan.entryIndex === null || (Number.isInteger(plan.entryIndex) && plan.entryIndex >= 0))
+            && plan.summary && typeof plan.latestCompletedAt === 'string'
+            && plan.latestCompletedAt === validIso(plan.latestCompletedAt) && safeReviewState(plan.reviewState));
+    }
+
+    async function readReviewPlans() {
+        const current = await kernel.read(REVIEW_PLANS_KEY, { withMeta: true });
+        return Object.assign({}, current, { data: currentReviewPlans(current.data) });
+    }
+
+    async function reviewPlanChange(layers, source, existing, foldedChildIds = []) {
+        const current = await readReviewPlans();
+        const plans = asArray(current.data).map(clone);
+        const summary = layers.summary;
+        // An annotation resave of the same historical record is not a new attempt.
+        const isNew = !(existing && existing.summary && existing.summary.data);
+        // Read explicit type aliases before the light projection drops them.
+        if (isNew && isRealPracticeRecord(summary) && practiceType(source) === 'reading') {
+            const entries = asArray(source.suiteEntries);
+            const candidates = entries.length ? entries : [source];
+            candidates.forEach((raw, index) => {
+                const entry = Object.assign({}, asObject(raw.realData), asObject(raw), {
+                    metadata: Object.assign({}, asObject(source.metadata), asObject(raw.metadata))
+                });
+                const examId = String(entry.examId || entry.metadata.examId || '').trim();
+                if (!examId) return;
+                const libraryConfigurationId = normalizeReviewLibraryConfigurationId(entry.metadata.libraryConfigurationId);
+                const planId = articleReviewPlanId(libraryConfigurationId, examId);
+                const grading = entries.length ? lightSuiteEntry(raw, 'reading') : summary;
+                const correct = grading.correctAnswers;
+                const total = grading.totalQuestions;
+                let quality;
+                try { quality = practiceReviewScheduler.qualityFromScore(correct, total); } catch (_) { return; }
+                const position = plans.findIndex(plan => plan.id === planId);
+                const previous = position >= 0 ? plans[position] : null;
+                const completedAt = validIso(entry.completedAt || entry.timestamp || entry.date) || reviewReferenceTime(summary);
+                const previousCompletedAt = previous?.latestCompletedAt;
+                if (previous && (previous.recordId === summary.id
+                    || (previousCompletedAt && completedAt < previousCompletedAt))) return;
+                // Perfect first attempts do not create a task. An existing task
+                // still advances when its latest reattempt reaches full marks.
+                if (!previous && Number(correct) === Number(total)) return;
+                const state = safeReviewState(previous?.reviewState) || practiceReviewScheduler.createInitialState(completedAt);
+                // A completion can be persisted after a later manual review. It is
+                // still the newest replay source, but its automatic grade must not
+                // move an already-newer schedule backwards.
+                const scheduleTime = state.updatedAt;
+                const preserveNewerSchedule = Boolean(previous && scheduleTime && completedAt < scheduleTime);
+                const compact = Object.fromEntries(['id', 'type', 'title', 'date', 'duration', 'totalQuestions', 'correctAnswers', 'accuracy', 'percentage', 'metadata']
+                    .filter(key => summary[key] !== undefined).map(key => [key, clone(summary[key])]));
+                const recordSummary = Object.assign({}, compact, {
+                    examId, title: entry.title || entry.metadata.examTitle || summary.title,
+                    metadata: Object.assign({}, asObject(compact.metadata), { libraryConfigurationId }),
+                    totalQuestions: Number(total), correctAnswers: Number(correct),
+                    accuracy: Number(correct) / Number(total), percentage: Number(correct) * 100 / Number(total),
+                    date: completedAt, duration: Number(entry.duration) || summary.duration
+                });
+                delete recordSummary.suiteEntrySummaries;
+                const plan = { id: planId, unit: 'article', examId, libraryConfigurationId, recordId: summary.id,
+                    entryIndex: entries.length ? index : null, summary: recordSummary, latestCompletedAt: completedAt,
+                    reviewState: foldedChildIds.includes(previous?.recordId) || preserveNewerSchedule ? state
+                        : practiceReviewScheduler.scheduleOutcome(state, quality, completedAt,
+                            'completion:' + summary.id + ':' + examId) };
+                if (position >= 0) plans[position] = plan;
+                else plans.push(plan);
+            });
+        }
+        return { logicalKey: REVIEW_PLANS_KEY, data: plans,
+            expectedRevision: current.envelope ? current.envelope.revision : 0 };
+    }
+
+    function practiceTimeValue(record) {
+        const raw = record && (record.date || record.completedAt || record.timestamp);
+        const parsed = Date.parse(raw);
+        return Number.isFinite(parsed) ? parsed : Number.POSITIVE_INFINITY;
+    }
+
+    // 队列顺序是产品承诺的一部分（先到期、再按计划时间、错题多的先做），
+    // 最后必须落到一个稳定键，否则同分记录在两次渲染间会互换位置。
+    function reviewQueueComparator(left, right) {
+        if (left.isDue !== right.isDue) return left.isDue ? -1 : 1;
+        const dueOrder = String(left.reviewState.nextReview).localeCompare(String(right.reviewState.nextReview));
+        if (dueOrder) return dueOrder;
+        if (left.wrongCount !== right.wrongCount) return right.wrongCount - left.wrongCount;
+        const leftTime = practiceTimeValue(left);
+        const rightTime = practiceTimeValue(right);
+        if (leftTime !== rightTime) return leftTime - rightTime;
+        return String(left.id || '').localeCompare(String(right.id || ''));
+    }
+
+    function localDateKey(date) {
+        const year = date.getFullYear();
+        const month = String(date.getMonth() + 1).padStart(2, '0');
+        const day = String(date.getDate()).padStart(2, '0');
+        return `${year}-${month}-${day}`;
+    }
+
+    // “未来 7 天负荷”只由当前 reviewState 推导：今日格子额外吃下所有逾期任务，
+    // 因为它们就是用户今天真正要做的量。这里不生产任何无法从状态还原的分母
+    // （例如“原计划 N / 已完成 M”），避免 UI 承诺数据层无法保证的口径。
+    function buildReviewQueueStats(records, now) {
+        const start = new Date(now); start.setHours(0, 0, 0, 0);
+        const buckets = Array.from({ length: 7 }, (_unused, index) => {
+            const date = new Date(start); date.setDate(date.getDate() + index);
+            return { date: date.toISOString(), dateKey: localDateKey(date), count: 0, includesOverdue: index === 0 };
+        });
+        const dayMs = 24 * 60 * 60 * 1000;
+        let dueToday = 0;
+        let overdue = 0;
+        let completedToday = 0;
+        for (const record of records) {
+            const due = new Date(record.reviewState.nextReview);
+            const dueDay = new Date(due.getFullYear(), due.getMonth(), due.getDate());
+            const dayOffset = Math.round((dueDay.getTime() - start.getTime()) / dayMs);
+            if (dayOffset < 0) {
+                overdue += 1;
+                buckets[0].count += 1;
+            } else if (dayOffset < buckets.length) {
+                if (dayOffset === 0) dueToday += 1;
+                buckets[dayOffset].count += 1;
+            }
+            const reviewed = record.reviewState.lastReviewed ? new Date(record.reviewState.lastReviewed) : null;
+            if (reviewed && localDateKey(reviewed) === localDateKey(start)) completedToday += 1;
+        }
+        return {
+            dueToday,
+            overdue,
+            dueNow: dueToday + overdue,
+            completedToday,
+            total: records.length,
+            futureSevenDayTotal: buckets.reduce((sum, bucket) => sum + bucket.count, 0),
+            buckets
+        };
     }
 
     function accuracyRatio(record) {
@@ -1003,7 +1228,9 @@
         async list(options = {}) {
             await ready;
             const projection = String(options.projection || 'full').toLowerCase();
-            if (projection === 'light' || projection === 'summary') return resolveBrowseSummaries(await kernel.listEntities('practiceSummaries'));
+            if (projection === 'light' || projection === 'summary') {
+                return (await resolveBrowseSummaries(await kernel.listEntities('practiceSummaries'))).map(withCurrentExamIds);
+            }
             const stores = projection === 'detail' || projection === 'medium'
                 ? ['practiceSummaries', 'practiceDetails']
                 : undefined;
@@ -1013,10 +1240,10 @@
             return asArray(snapshot.practiceSummaries).map(summary => {
                 const id = practiceLayerId(summary);
                 const detail = details.get(id);
-                return joinPracticeRecord(upgradeBrowseSummary(summary, detail), detail, annotations.get(id), projection);
+                return withCurrentExamIds(joinPracticeRecord(upgradeBrowseSummary(summary, detail), detail, annotations.get(id), projection));
             }).filter(Boolean);
         },
-        async get(recordId, options = {}) { await ready; return joinedPractice(String(recordId || ''), options.projection || 'full'); },
+        async get(recordId, options = {}) { await ready; return withCurrentExamIds(await joinedPractice(String(recordId || ''), options.projection || 'full')); },
         // Positive journal evidence only: retention can remove old receipts, so
         // absence is never proof that an operation did not commit. This read-only
         // reconciliation does not resubmit, clear recovery, or alter sessions.
@@ -1045,7 +1272,7 @@
                 receipt = await retryMergeConflict(command || {}, async () => {
                     const existing = await practiceLayersForUpsert(recordId);
                     return kernel.mutateEntities(practiceUpserts(recordId, layers, existing),
-                        { ...mutation, documentChanges: await sealReadingTiming(recordInput, recordId, existing.detail?.data) });
+                        { ...mutation, documentChanges: [await reviewPlanChange(layers, recordInput, existing), ...await sealReadingTiming(recordInput, recordId, existing.detail?.data)] });
                 });
                 return Object.assign({}, receipt, { record: await joinedPractice(recordId, 'full') });
 
@@ -1073,7 +1300,7 @@
                     const existing = await practiceLayersForUpsert(recordId);
                     const deletes = Array.from(children).flatMap((id) => ['practiceSummaries', 'practiceDetails', 'practiceAnnotations'].map((store) => ({ type: 'delete', store, recordId: id })));
                     return kernel.mutateEntities(deletes.concat(practiceUpserts(recordId, layers, existing)),
-                        { ...mutation, documentChanges: await sealReadingTiming(input, recordId, existing.detail?.data, children) });
+                        { ...mutation, documentChanges: [await reviewPlanChange(layers, input, existing, Array.from(children)), ...await sealReadingTiming(input, recordId, existing.detail?.data, children)] });
                 });
                 return Object.assign({}, receipt, { record: await joinedPractice(recordId, 'full') });
 
@@ -1082,20 +1309,108 @@
                 throw error;
             }
         },
+        async listReviewQueue(options = {}) {
+            await ready;
+            const nowIsoValue = validIso(options.now) || nowIso();
+            const now = new Date(nowIsoValue);
+            const current = await readReviewPlans();
+            const records = [];
+            for (const plan of asArray(current.data)) {
+                const reviewState = safeReviewState(plan.reviewState);
+                if (!reviewState || !plan.recordId || !plan.summary) continue;
+                records.push(Object.assign({}, clone(plan.summary), {
+                    id: reviewTaskId(plan),
+                    recordId: plan.recordId, reviewPlanId: plan.id, reviewUnit: plan.unit,
+                    reviewExamId: plan.examId, reviewEntryIndex: plan.entryIndex,
+                    reviewLibraryConfigurationId: plan.libraryConfigurationId,
+                    reviewState, wrongCount: reviewWrongCount(plan.summary), isDue: new Date(reviewState.nextReview) <= now
+                }));
+            }
+            records.sort(reviewQueueComparator);
+            return {
+                generatedAt: nowIsoValue,
+                records,
+                stats: buildReviewQueueStats(records, now)
+            };
+        },
+        async getReviewTask(taskId) {
+            await ready;
+            const { data } = await readReviewPlans();
+            const id = String(taskId || '');
+            const plan = asArray(data).find(row => row.id === id || row.recordId === id
+                || reviewTaskId(row) === id);
+            return plan ? clone(plan) : null;
+        },
+        async getReviewState(recordId) {
+            const task = await practice.getReviewTask(recordId);
+            if (task) return safeReviewState(task.reviewState);
+            const id = String(recordId || '').trim();
+            if (!id || !(await kernel.readEntity('practiceSummaries', id))) throw new AppDataError('VALIDATION', 'Unknown practice record');
+            return null;
+        },
+        async recordReviewOutcome(command) {
+            await ready; assertObject(command, 'recordReviewOutcome command is required');
+            const recordId = String(command.recordId || '').trim();
+            const attemptId = String(command.reviewAttemptId || '').trim();
+            const quality = String(command.quality || '').toLowerCase();
+            const reviewedAt = validIso(command.reviewedAt || nowIso());
+            if (!recordId || !attemptId || !reviewedAt || !practiceReviewScheduler.VALID_QUALITIES.includes(quality)) {
+                throw new AppDataError('VALIDATION', 'Valid recordId, reviewAttemptId, quality and reviewedAt are required');
+            }
+            const mutation = mutationOptions(command, 'practice-review-outcome', command);
+            let resultState;
+            const receipt = await retryMergeConflict(command, async () => {
+                const current = await readReviewPlans();
+                const plans = asArray(current.data).map(clone);
+                const task = plans.find(row => command.reviewPlanId ? row.id === command.reviewPlanId : row.recordId === recordId);
+                if (!task) throw new AppDataError(command.reviewPlanId ? 'CONFLICT' : 'VALIDATION', 'Review task is not scheduled');
+                if (task.recordId !== recordId) throw new AppDataError('CONFLICT', 'Review task was replaced by a newer attempt');
+                if (command.expectedRevision !== undefined && Number(command.expectedRevision) !== Number(current.envelope?.revision || 0)) {
+                    throw new AppDataError('CONFLICT', 'Review plan revision conflict');
+                }
+                const normalized = safeReviewState(task.reviewState);
+                if (!normalized) throw new AppDataError('VALIDATION', 'Invalid review state');
+                if (normalized.appliedReviewAttemptIds.includes(attemptId)) {
+                    resultState = normalized;
+                    return Object.assign(await kernel.journalNoop(mutation), { noop: true, duplicate: true });
+                }
+                const scheduleTime = normalized.updatedAt;
+                if (scheduleTime && reviewedAt < scheduleTime) {
+                    throw new AppDataError('CONFLICT', 'Review outcome is older than the current schedule');
+                }
+                resultState = practiceReviewScheduler.scheduleOutcome(normalized, quality, reviewedAt, attemptId);
+                task.reviewState = resultState;
+                const documentChanges = [{ logicalKey: REVIEW_PLANS_KEY, data: plans,
+                    expectedRevision: current.envelope?.revision || 0 }];
+                return kernel.mutate(documentChanges, mutation);
+            });
+            return Object.assign({}, receipt, { reviewState: resultState });
+        },
         async updateAnnotations(command) {
             await ready; assertObject(command, 'updateAnnotations command is required'); const recordId = String(command.recordId || '');
             return retryMergeConflict(command, async () => {
                 const current = await practiceLayers(recordId, true); if (!current.summary) throw new AppDataError('VALIDATION', `Unknown practice record: ${recordId}`);
                 if (command.expectedRevision !== undefined && Number(command.expectedRevision) !== entityRevision(current.annotations)) throw new AppDataError('CONFLICT', `Revision conflict for practice annotations ${recordId}`);
                 const annotations = Object.assign({ recordId }, clone(asObject(current.annotations && current.annotations.data)));
+                // 标注补丁只承载内容（highlights/notes/marks/scrollY）。复盘调度状态的唯一
+                // 写入口是 recordReviewOutcome：否则题目页可以借标注同步伪造复盘进度。
+                delete annotations.reviewState;
+                const patch = clone(asObject(command.patch)); delete patch.reviewState;
                 const detail = clone(asObject(current.detail && current.detail.data)); const examId = String(command.examId || current.summary.data.examId || 'default');
+                const resolveExamId = typeof global.resolveReadingExamId === 'function' ? global.resolveReadingExamId : (id) => id;
+                const matchesExamId = (id) => resolveExamId(String(id)) === resolveExamId(examId);
+                // Replay projects canonical IDs, but annotations must keep the keys
+                // used by the stored record and joinPracticeRecord.
                 if (Array.isArray(detail.suiteEntries) && detail.suiteEntries.length) {
-                    if (!detail.suiteEntries.some((entry) => String(entry.examId || asObject(entry.metadata).examId || '') === examId)) throw new AppDataError('VALIDATION', `Suite record ${recordId} does not contain exam ${examId}`);
-                    annotations.suiteEntries = Object.assign({}, asObject(annotations.suiteEntries), { [examId]: Object.assign({}, asObject(annotations.suiteEntries)[examId], clone(asObject(command.patch))) });
+                    const entry = detail.suiteEntries.find((entry) => matchesExamId(entry.examId || asObject(entry.metadata).examId || ''));
+                    if (!entry) throw new AppDataError('VALIDATION', `Suite record ${recordId} does not contain exam ${examId}`);
+                    const storedExamId = String(entry.examId || asObject(entry.metadata).examId || entry.id);
+                    annotations.suiteEntries = Object.assign({}, asObject(annotations.suiteEntries), { [storedExamId]: Object.assign({}, asObject(annotations.suiteEntries)[storedExamId], clone(patch)) });
                 } else {
-                    if (current.summary.data.examId && String(current.summary.data.examId) !== examId) throw new AppDataError('VALIDATION', `Record ${recordId} does not match exam ${examId}`);
-                    annotations.annotations = Object.assign({}, asObject(annotations.annotations), { [examId]: Object.assign({}, asObject(annotations.annotations)[examId], clone(asObject(command.patch))) });
-                    Object.assign(annotations, clone(asObject(command.patch)));
+                    const storedExamId = String(current.summary.data.examId || examId);
+                    if (current.summary.data.examId && !matchesExamId(storedExamId)) throw new AppDataError('VALIDATION', `Record ${recordId} does not match exam ${examId}`);
+                    annotations.annotations = Object.assign({}, asObject(annotations.annotations), { [storedExamId]: Object.assign({}, asObject(annotations.annotations)[storedExamId], clone(patch)) });
+                    Object.assign(annotations, clone(patch));
                 }
                 return kernel.mutateEntities([{
                     type: 'upsert',
@@ -1107,18 +1422,35 @@
             });
         },
         async delete(command) {
-            await ready; const recordId = String(command && (command.recordId || command.id) || command || ''); if (!recordId) throw new AppDataError('VALIDATION', 'practice record id is required');
-            const found = await kernel.readEntity('practiceSummaries', recordId); if (!found) return Object.assign(await kernel.journalNoop(mutationOptions(command, 'practice-delete', { recordId })), { deletedCount: 0, noop: true });
-            const receipt = await kernel.mutateEntities(['practiceSummaries', 'practiceDetails', 'practiceAnnotations'].map((store) => ({ type: 'delete', store, recordId })), mutationOptions(command, 'practice-delete', { recordId }));
-            return Object.assign({}, receipt, { deletedCount: 1 });
+            const id = String(command && (command.recordId || command.id) || command || '');
+            return practice.deleteMany(Object.assign({}, typeof command === 'object' ? command : {}, { recordIds: [id] }));
         },
         async deleteMany(command) {
-            await ready; assertObject(command, 'practice.deleteMany command is required'); const recordIds = Array.from(new Set(asArray(command.recordIds).map(String).filter(Boolean)));
-            if (!recordIds.length) throw new AppDataError('VALIDATION', 'practice.deleteMany requires recordIds'); const summaries = await kernel.listEntities('practiceSummaries'); const ids = recordIds.filter((id) => summaries.some((item) => practiceRecordMatches(item, [id])));
-            if (!ids.length) return Object.assign(await kernel.journalNoop(mutationOptions(command, 'practice-delete-many', { recordIds })), { deletedCount: 0, noop: true });
-            const receipt = await kernel.mutateEntities(ids.flatMap((recordId) => ['practiceSummaries', 'practiceDetails', 'practiceAnnotations'].map((store) => ({ type: 'delete', store, recordId }))), mutationOptions(command, 'practice-delete-many', { recordIds })); return Object.assign({}, receipt, { deletedCount: ids.length });
+            await ready; assertObject(command, 'practice.deleteMany command is required');
+            const recordIds = Array.from(new Set(asArray(command.recordIds).map(String).filter(Boolean)));
+            if (!recordIds.length) throw new AppDataError('VALIDATION', 'practice.deleteMany requires recordIds');
+            return retryMergeConflict(command, async () => {
+                const summaries = await kernel.listEntities('practiceSummaries');
+                const ids = recordIds.filter(id => summaries.some(item => practiceRecordMatches(item, [id])));
+                if (!ids.length) return Object.assign(await kernel.journalNoop(mutationOptions(command, 'practice-delete-many', { recordIds })), { deletedCount: 0, noop: true });
+                const current = await readReviewPlans();
+                const documentChanges = [{ logicalKey: REVIEW_PLANS_KEY,
+                    data: asArray(current.data).filter(plan => !ids.includes(plan.recordId)), expectedRevision: current.envelope?.revision || 0 }];
+                const receipt = await kernel.mutateEntities(ids.flatMap(recordId => PRACTICE_ENTITY_STORES.map(store => ({ type: 'delete', store, recordId }))),
+                    Object.assign({}, mutationOptions(command, 'practice-delete-many', { recordIds }), { documentChanges }));
+                return Object.assign({}, receipt, { deletedCount: ids.length });
+            });
         },
-        async clear(command = {}) { await ready; return kernel.mutateEntities(['practiceSummaries', 'practiceDetails', 'practiceAnnotations'].map((store) => ({ type: 'clear', store })), mutationOptions(command, 'practice-clear', { all: true })); },
+        async clear(command = {}) {
+            await ready;
+            return retryMergeConflict(command, async () => {
+                const current = await readReviewPlans();
+                return kernel.mutateEntities(PRACTICE_ENTITY_STORES.map(store => ({ type: 'clear', store })),
+                    Object.assign({}, mutationOptions(command, 'practice-clear', { all: true }), { documentChanges: [{
+                        logicalKey: REVIEW_PLANS_KEY, data: [], expectedRevision: current.envelope?.revision || 0
+                    }] }));
+            });
+        },
         async listInsights(options = {}) {
             await ready;
             const limit = Math.max(1, Math.min(50, Number(options.limit) || 10));
@@ -1128,11 +1460,11 @@
                     .localeCompare(String(left.date || left.completedAt || left.timestamp || '')))
                 .slice(0, limit);
             return Promise.all(summaries.map(async (summary) => {
-                if (Object.keys(asObject(summary.questionTypeErrorCounts)).length) return clone(summary);
+                if (Object.keys(asObject(summary.questionTypeErrorCounts)).length) return withCurrentExamIds(clone(summary));
                 const detail = await kernel.readEntity('practiceDetails', summary.id);
-                return jsonValue(Object.assign({}, clone(summary), {
+                return withCurrentExamIds(jsonValue(Object.assign({}, clone(summary), {
                     questionTypeErrorCounts: questionTypeErrorCounts(detail)
-                }), 'practice insight');
+                }), 'practice insight'));
             }));
         },
         async getStats() { await ready; return computeStats(await kernel.listEntities('practiceSummaries')); },
@@ -1948,6 +2280,9 @@
     }
 
     function collectionIdentity(logicalKey, value) {
+        if (logicalKey === REVIEW_PLANS_KEY && value && value.unit === 'article') {
+            return articleReviewPlanId(value.libraryConfigurationId, value.examId);
+        }
         if (logicalKey === 'vocab.readingVocabWords') {
             const word = value && (value.word || value.id);
             return word ? String(word).trim().toLowerCase() : idOf(value, ['id', 'word']);
@@ -1960,14 +2295,41 @@
         return logicalKey === 'vocab.words' ? identity.trim().toLowerCase() : identity;
     }
 
+    function mergeReviewPlan(existing, incoming) {
+        const stored = asObject(existing);
+        const imported = asObject(incoming);
+        const merged = Object.assign({}, clone(stored), clone(imported));
+        const storedState = safeReviewState(stored.reviewState);
+        const importedState = safeReviewState(imported.reviewState);
+        const storedScheduleTime = storedState.updatedAt;
+        const importedScheduleTime = importedState.updatedAt;
+        const scheduleSource = storedState && (!importedState || storedScheduleTime > importedScheduleTime)
+            ? stored : imported;
+        const storedCompletionTime = stored.latestCompletedAt;
+        const importedCompletionTime = imported.latestCompletedAt;
+        const replaySource = storedCompletionTime > importedCompletionTime
+            ? stored : imported;
+        const replayCompletedAt = replaySource === stored ? storedCompletionTime : importedCompletionTime;
+
+        for (const field of ['recordId', 'entryIndex', 'summary']) {
+            if (hasOwn(replaySource, field)) merged[field] = clone(replaySource[field]);
+            else delete merged[field];
+        }
+        if (replayCompletedAt) merged.latestCompletedAt = replayCompletedAt;
+        else delete merged.latestCompletedAt;
+        if (hasOwn(scheduleSource, 'reviewState')) merged.reviewState = clone(scheduleSource.reviewState);
+        else delete merged.reviewState;
+        return merged;
+    }
+
     function mergeCollection(existing, incoming, logicalKey) {
-        const result = asArray(existing).map((item) => clone(item));
+        const result = (logicalKey === REVIEW_PLANS_KEY ? currentReviewPlans(existing) : asArray(existing)).map(clone);
         const positions = new Map();
         result.forEach((item, index) => {
             const identity = collectionIdentity(logicalKey, item);
             if (identity) positions.set(identity, index);
         });
-        for (const rawItem of asArray(incoming)) {
+        for (const rawItem of (logicalKey === REVIEW_PLANS_KEY ? currentReviewPlans(incoming) : asArray(incoming))) {
             const item = jsonValue(rawItem, `${logicalKey} item`);
             const identity = collectionIdentity(logicalKey, item);
             if (!identity) throw new AppDataError('VALIDATION', `${logicalKey} import item has no stable identity`);
@@ -1987,6 +2349,8 @@
                     createdAt: Math.min(Number(existingWord.createdAt) || Date.now(), Number(item.createdAt) || Date.now()),
                     updatedAt: Math.max(Number(existingWord.updatedAt) || 0, Number(item.updatedAt) || 0)
                 });
+            } else if (logicalKey === REVIEW_PLANS_KEY && position !== undefined) {
+                mergedItem = mergeReviewPlan(result[position], item);
             }
             if (position !== undefined) result[position] = mergedItem;
             else {
@@ -2089,6 +2453,9 @@
             if (!replaceDocuments && envelope.state === 'present') {
                 next = internals.makeEnvelope(entry, mergeImportValue(entry, current.data, envelope.data), { operationId: randomId('import-merge') });
             }
+            if (logicalKey === REVIEW_PLANS_KEY && next.state === 'present') {
+                next = internals.makeEnvelope(entry, currentReviewPlans(next.data), { operationId: randomId('review-import') });
+            }
             snapshot.envelopes[logicalKey] = next;
             keys.push(logicalKey);
             if (next.state === 'cleared') clearedKeys.push(logicalKey);
@@ -2145,6 +2512,25 @@
                 snapshot.entities[store] = rows;
             }
             assertPracticeEntitySetsMatch(snapshot.entities);
+            // Restore current article plans only, with an owner in the final record set.
+            // A history backup without plans does not enroll its old practice records.
+            const planCurrent = await kernel.read(REVIEW_PLANS_KEY, { withMeta: true });
+            // A merged document must retain the revision of the data it used.
+            // A later read cannot make an already-stale merge safe to install.
+            if (!hasOwn(revisionToken.documents, REVIEW_PLANS_KEY)) {
+                revisionToken.documents[REVIEW_PLANS_KEY] = planCurrent.envelope?.revision || 0;
+            }
+            const importedPlans = snapshot.envelopes[REVIEW_PLANS_KEY]?.data;
+            const plans = importedPlans === undefined ? (replacePractice ? [] : planCurrent.data) : importedPlans;
+            const ownerIds = new Set(snapshot.entities.practiceSummaries.map(row => row.recordId));
+            const validPlans = currentReviewPlans(plans).filter(plan => ownerIds.has(plan.recordId));
+            for (const row of snapshot.entities.practiceAnnotations) {
+                delete row.data.reviewState;
+                for (const entry of Object.values(asObject(row.data.suiteEntries))) delete entry.reviewState;
+                row.checksum = checksum(row.data);
+            }
+            snapshot.envelopes[REVIEW_PLANS_KEY] = internals.makeEnvelope(catalog.get(REVIEW_PLANS_KEY), validPlans, { operationId: randomId('review-import') });
+            if (!keys.includes(REVIEW_PLANS_KEY)) keys.push(REVIEW_PLANS_KEY);
         }
 
         snapshot.checksum = checksum({ envelopes: snapshot.envelopes, entities: snapshot.entities });
@@ -3369,6 +3755,16 @@
         }
         return patch;
     }
+    function currentFavoriteIdentity(key) {
+        try {
+            const parts = JSON.parse(key);
+            if (!Array.isArray(parts) || parts.length !== 3 || typeof global.resolveReadingExamId !== 'function') return key;
+            return JSON.stringify([parts[0], parts[1], global.resolveReadingExamId(parts[2])]);
+        } catch (_) {
+            return key;
+        }
+    }
+
     async function setReadingFavorite(identity, favorite, options = {}) {
         const parts = JSON.parse(identity);
         if (!Array.isArray(parts) || parts.length !== 3 || parts[1] !== 'reading'
@@ -3383,7 +3779,13 @@
             const browse = asObject(values.browse);
             const favorites = Object.assign({}, asObject(browse.readingFavorites));
             if (favorite) favorites[identity] = true;
-            else delete favorites[identity];
+            else {
+                // Also clear keys saved under a retired ID of the same passage.
+                const passage = currentFavoriteIdentity(identity);
+                for (const key of Object.keys(favorites)) {
+                    if (currentFavoriteIdentity(key) === passage) delete favorites[key];
+                }
+            }
             const next = Object.assign({}, values, {
                 browse: Object.assign({}, browse, { readingFavorites: favorites })
             });
